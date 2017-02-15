@@ -1,4 +1,5 @@
 library(data.table);
+library(spatstat);
 library(imager);
 library(akima);
 library(compiler);
@@ -10,19 +11,45 @@ library(oro.nifti);
 ############################
 
 INPUT_FOLDER <- "data/train/sample_images";
+TRUTH_LABELS <- fread("./data/train/stage1_labels.csv");
 
 ############################
 ## User-Defined Functions ##
 ############################
 
+
+#' @name        fn_Age
+#' @author      Steven Rankine, Kendall-Greene Associates
+#' @date        2017-02-11 
+#' @description  
+#' @references   
+#' 
+fn_Age <- cmpfun(function(birthDate, output="y"){
+  t2 <- as.integer(strsplit(format(Sys.time(), "%Y-%m-%d"), "-")[[1]]);
+  t1 <- as.integer(strsplit(str2date(birthDate, format.in="%Y%m%d", format.out="%Y-%m-%d"), "-")[[1]]);
+  t0 <- abs(t2 - t1);
+  t0 <- t0 * switch(output,
+    d = c(365.000000000, 30.416670000,  1.000000000),
+    m = c( 12.000000000,  1.000000000,  0.002739726),
+    y = c(  1.000000000,  0.083333333,  0.002739726)
+  );
+  return (sum(t0));
+});
+
+
+#' @name        fn_Malignancy
+#' @author      Steven Rankine, Kendall-Greene Associates
+#' @date        2017-02-11 
+#' @description  
+#' @references   
+#' 
 fn_Malignancy <- cmpfun(function(nodeSize){
   x_min <- min(nodeSize);
   x_max <- max(nodeSize);
-  if(x_min <= 3){
-    mayo  <- 0.1
-    elcap <- 0.0;
-  } else if(x_min > 2  & x_max < 5) {
-    mayo  <- 0.1
+  mayo  <- 0.1;
+  elcap <- 0.0;
+  if(x_min > 2  & x_max < 5) {
+    mayo  <- 0.1;
     elcap <- 1.0;
   } else if(x_min > 4  & x_max < 7) {
     mayo  <- 0.7;
@@ -39,9 +66,13 @@ fn_Malignancy <- cmpfun(function(nodeSize){
   } else if(x_min > 21 & x_max < 45) {
     mayo  <- 33.3;
     elcap <- 80.0;
+  } else if(x_min > 45) {
+    mayo  <- 33.3;
+    elcap <- 80.0;
   }
-  return (list(elcap,mayo));
+  return (list(elcap=elcap,mayo=mayo));
 });
+
 
 #' @name        fn_Resample
 #' @author      Steven Rankine, Kendall-Greene Associates
@@ -98,12 +129,12 @@ fn_CT2HU <- cmpfun(function(im, slope, intcp) {
 fn_DetectThreshold <- cmpfun(function(im){ 
 
   ## Filter out non-lung tissue  
-  im[im <  -700]              <- -1000; # Air
-  # im[im >= -700 & im <  -300] <-  -500; # Normal Lung Tissue
-  # im[im >=  -20 & im <     0] <-   +15; # Lung Nodule Tissue
-  # im[im >     0 & im <= +200] <-   +15; # Lung Nodule Tissue
-  im[im >= +400]              <- +1000; # Bone, Blood, Muscle, etc
+  im[im <  -700] <- -1000; # Air
+  im[im >= +400] <- +1000; # Bone, Blood, Muscle, etc
 
+  ## Apply a Gaussian blur to reduce noise and avoid false circle detection:
+  im <- blur(as.im(im))$v;
+  
   ## Statistics of image center
   lb <- as.integer(dim(im)*0.25);
   ub <- as.integer(dim(im)*0.75);
@@ -120,7 +151,7 @@ fn_DetectThreshold <- cmpfun(function(im){
   im_thres <- mean(im_clust$centers);
   im[im <  im_thres] <- 0;
   im[im >= im_thres] <- 1;
-  rm(im_clust, im_thres, im_ctr);
+  rm(im_clust, im_thres, im_ctr); 
   
   return (im);
   
@@ -138,31 +169,21 @@ fn_DetectThreshold <- cmpfun(function(im){
 fn_ProcessDicom <- cmpfun(function(dcm){
   
   ## 
-  today <- as.integer(format(Sys.time(), "%Y%m%d"));
-  hdr   <- dicomTable(dcm$hdr);
-  # nii <- dicom2nifti(dcm);  
+  hdr    <- dicomTable(dcm$hdr);
   img_ct <- dcm$img;
   img_hu <- list(NULL);   
   img_th <- list(NULL);
+  info   <- list(NULL);
+  imax   <- length(img_ct);
+
   ## Convert DICOM fields to numeric where possible
-  # hdr$`0002-0000-GroupLength`         <- as.numeric(hdr$`0002-0000-GroupLength`);
-  hdr$`0010-0030-PatientsBirthDate`   <- as.integer(hdr$`0010-0030-PatientsBirthDate`);
-  # hdr$`0020-0011-SeriesNumber`        <- as.numeric(hdr$`0020-0011-SeriesNumber`);
-  # hdr$`0020-0012-AcquisitionNumber`   <- as.numeric(hdr$`0020-0012-AcquisitionNumber`);
   hdr$`0020-0013-InstanceNumber`      <- as.numeric(hdr$`0020-0013-InstanceNumber`);
   hdr$`0020-1041-SliceLocation`       <- as.numeric(hdr$`0020-1041-SliceLocation`);
-  # hdr$`0028-0002-SamplesperPixel`     <- as.numeric(hdr$`0028-0002-SamplesperPixel`);
   hdr$`0028-0010-Rows`                <- as.integer(hdr$`0028-0010-Rows`);
   hdr$`0028-0011-Columns`             <- as.integer(hdr$`0028-0011-Columns`);
-  # hdr$`0028-0100-BitsAllocated`       <- as.integer(hdr$`0028-0100-BitsAllocated`);
-  # hdr$`0028-0101-BitsStored`          <- as.integer(hdr$`0028-0101-BitsStored`);
-  # hdr$`0028-0102-HighBit`             <- as.integer(hdr$`0028-0102-HighBit`);
-  # hdr$`0028-0103-PixelRepresentation` <- as.integer(hdr$`0028-0103-PixelRepresentation`);
-  # hdr$`0028-0120-PixelPaddingValue`   <- as.integer(hdr$`0028-0120-PixelPaddingValue`);
-  # hdr$`0028-1050-WindowCenter`        <- as.double( hdr$`0028-1050-WindowCenter`);
-  # hdr$`0028-1051-WindowWidth`         <- as.double( hdr$`0028-1051-WindowWidth`);
   hdr$`0028-1052-RescaleIntercept`    <- as.double( hdr$`0028-1052-RescaleIntercept`);
   hdr$`0028-1053-RescaleSlope`        <- as.double( hdr$`0028-1053-RescaleSlope`);
+
   ## Sort into slice order
   if(is.null(hdr$`0020-0013-InstanceNumber`)){
     tmpZ <- hdr$`0020-0032-ImagePositionPatient`;
@@ -173,87 +194,168 @@ fn_ProcessDicom <- cmpfun(function(dcm){
   hdr <- hdr[order(tmpZ),];      # Sort metadata
   img_ct <- img_ct[order(tmpZ)]; # sort original CT images
 
-  ## User-defined metadata
-  hdr$LungNormal     <- rep(0,length(img_ct));
-  hdr$LungBenign     <- rep(0,length(img_ct));
-  hdr$LungMalign     <- rep(0,length(img_ct));
-  hdr$PatientAge     <- rep(0,length(img_ct));
-  hdr$SliceThickness <- abs(tmpZ[order(tmpZ)][1]-tmpZ[order(tmpZ)][2]);
-  if(!is.null(hdr$`0020-1041-SliceLocation`)){
-    hdr$SliceThickness <- abs(hdr$`0020-1041-SliceLocation`[1] - hdr$`0020-1041-SliceLocation`[2]);
-  }
+  ## Intialize Feature Variables
+  info$Lung.Normal   <- rep(0, imax);
+  info$Lung.Benign   <- rep(0, imax);
+  info$Lung.Malign   <- rep(0, imax);
+  info$Patient.Age   <- rep(0, imax);
+  info$Slice.Space.x <- rep(0, imax);
+  info$Slice.Space.y <- rep(0, imax);
+  info$Slice.Space.z <- rep(abs(tmpZ[order(tmpZ)][1]-tmpZ[order(tmpZ)][2]), imax);
+  rm(tmpZ);
   
-  ## Process images
+  ## Process images & extract features
   spc2 <- c(0.597656, 0.597656);
-  for(i in 1:length(img_ct)) {
+  for(i in 1:imax) {
     slope <- as.double( hdr$`0028-1053-RescaleSlope`[i]);
     intcp <- as.integer(hdr$`0028-1052-RescaleIntercept`[i]);
     spc1  <- as.double(unlist(strsplit(hdr$`0028-0030-PixelSpacing`[[1]]," ")));
     ## Save transformations
-    img_ct[[i]] <- fn_Resample(img_ct[[i]], spc1, spc2);     # 
-    img_hu[[i]] <- fn_CT2HU(img_ct[[i]], slope, intcp);      # Convert CT scans into Hounsfield units (HU)
-    img_th[[i]] <- fn_DetectThreshold(img_hu[[i]]);          # Convert HU scan into B&W
-    ## HU Pixel Counting
-    tmp <- img_hu[[i]];
-    hdr$LungNormal[i] <- length(tmp[tmp< -300 & tmp> -700]); # Possible Normal Lung Tissue
-    hdr$LungBenign[i] <- length(tmp[tmp<    0 & tmp> -20]);  # Possible Benign Lung Nodule Tissue
-    hdr$LungMalign[i] <- length(tmp[tmp< +200 & tmp>   0]);  # Possible Malignant Lung Nodule Tissue
+    # img_ct[[i]] <- fn_Resample(img_ct[[i]], spc1, spc2);       # 
+    img_hu[[i]] <- fn_CT2HU(img_ct[[i]], slope, intcp);          # Convert CT scans into Hounsfield units (HU)
+    img_th[[i]] <- fn_DetectThreshold(img_hu[[i]]);              # Convert HU scan into B&W
+    
     ## 
-    hdr$PatientAge <- (today - hdr$`0010-0030-PatientsBirthDate`[i])/365;
+    circles <- data.table(a=0,b=0,R=0);
+    lb  <- as.integer(dim(img_th[[i]])*0.3);
+    ub  <- as.integer(dim(img_th[[i]])*0.7);
+    rmx <- as.integer(45.0/min(spc1));
+    rmn <- as.integer(4.0/min(spc1));
+    for(j in lb[1]:ub[1]){
+      for(k in lb[2]:ub[2]){
+        tmp <- fn_IsCenterOfCircle(j, k, rmn, rmx, img_th[[i]]);
+        if(tmp[3] != 0){
+          circles <- rbind(circles, tmp);
+        }
+    }}
+    
+    ## HU Pixel Counting Features
+    tmp <- img_hu[[i]];
+    info$Lung.Normal[i] <- length(tmp[tmp < -300 & tmp > -700]);# Possible Normal Lung Tissue
+    info$Lung.Benign[i] <- length(tmp[tmp <    0 & tmp > -20]); # Possible Benign Lung Nodule Tissue
+    info$Lung.Malign[i] <- length(tmp[tmp < +200 & tmp >   0]); # Possible Malignant Lung Nodule Tissue
+    ## Patient Features
+    info$Patient.Age[i]  <- fn_Age(hdr$`0010-0030-PatientsBirthDate`[i]);
+    info$Patient.Risk[i] <- FALSE;
+    ## 
+    tmp <- fn_Malignancy(circles[,3]);
+    info$Diagnosis.Mayo[i]  <- tmp$mayo;
+    info$Diagnosis.ELCAP[i] <- tmp$elcap;
+    ## Slice Feature
+    info$Slice.Space.x[i] <- spc1[1];
+    info$Slice.Space.y[i] <- spc1[2];
+    rm(tmp, circles, spc1, slope, intcp);
   }
-  
-  return(list(hdr=hdr,img_ct=img_ct,img_hu=img_hu,img_th=img_th));
+  rm(hdr, imax, spc2); gc();
+  return(list(info=info,img_ct=img_ct,img_hu=img_hu,img_th=img_th));
   
 });
 
+
+#' @name        fn_IsCenterOfCircle
+#' @author      Steven Rankine, Kendall-Greene Associates
+#' @date        2017-02-13 
+#' @description  
+#' @references   
+#' 
+fn_IsCenterOfCircle <- cmpfun(function(a, b, rmin, rmax, im, cvalue=1) {
+  
+  out <- c(a,b,0);
+  if(im[a,b] == cvalue){
+    nextR <- TRUE;
+    for(R in rmin:rmax){
+      for(theta in seq(from=0, to=2*pi, by=pi/4)){
+        z <- c(as.integer(a+R*cos(theta)), as.integer(b+R*sin(theta)));
+        z[z<c(1,1)]  <- 1;
+        z[z>dim(im)] <- min(dim(im));
+        nextR <- nextR & ifelse(im[z[1],z[2]] == im[a,b], T, F);
+      }
+      if(!nextR){ break; }
+      out[3] <- R; 
+    }
+  }
+  return (out);
+  
+});
+
+fn_HoughTransformCircles <- cmpfun(function(im, spc){
+  circles <- data.table(a=0,b=0,R=0);
+  lb  <- as.integer(dim(im)*0.3);
+  ub  <- as.integer(dim(im)*0.7);
+  rmx <- as.integer(45.0/min(spc));
+  rmn <- as.integer(4.0/min(spc));
+  for(j in lb[1]:ub[1]){
+    for(k in lb[2]:ub[2]){
+      tmp <- fn_IsCenterOfCircle(j, k, rmn, rmx, im);
+      if(tmp[3] != 0){
+        circles <- rbind(circles, tmp);
+      }
+  }}
+  return (circles);
+});
 
 ############################
 ##      Main Program      ##
 ############################
 
-labels <- fread("./data/train/stage1_labels.csv");
+
+## Create empty data frame to capture scan features
 df <- data.frame(
-  id     = NULL,
-  cancer = NULL,
-  age    = NULL,
-  norm   = NULL,
-  benign = NULL,
-  malign = NULL,
-  risk   = NULL,
-  elcap  = NULL,
-  mayo   = NULL
+  id      = as.character(NULL), # Unique patient ID
+  truth   = as.double(NULL),    # True cancer prognosis
+  cancer  = as.double(NULL),    # Predicted cancer prognosis
+  ncount  = as.integer(NULL),   # Number of nodules > 3mm
+  nwidth  = as.integer(NULL),   # 
+  nlength = as.integer(NULL),   # 
+  norm    = as.integer(NULL),   # Number of pixels in normal lung range
+  benign  = as.integer(NULL),   # Number of pixels in benign nodule range
+  malign  = as.integer(NULL),   # Number of pixels in malignant nodule range
+  mayo    = as.double(NULL),    # 
+  elcap   = as.double(NULL),    # 
+  age     = as.double(NULL),    # Patient age as of today
+  risk    = as.logical(NULL)    # Is patient a smoker or have family history
 );
 
-
+## Search for features
 timestamp();
 for(pid in list.files(path=INPUT_FOLDER)){
-  fn   <- paste0(INPUT_FOLDER, "/", pid);
-  dcm  <- readDICOM(fn, verbose=T, recursive=FALSE);
-  this <- fn_ProcessDicom(dcm);
-  df   <- rbind(df,cbind(
-    id     = pid,
-    cancer = labels[labels$id==pid,'cancer'],
-    age    = unique(this$hdr$PatientAge),
-    norm   = sum(this$hdr$LungNormal),
-    benign = sum(this$hdr$LungBenign),
-    malign = sum(this$hdr$LungMalign),
-    risk   = 0.0,
-    elcap  = 0.0,
-    mayo   = 0.0
+  dcm   <- readDICOM(paste0(INPUT_FOLDER, "/", pid), verbose=T, recursive=F);
+  truth <- TRUTH_LABELS[TRUTH_LABELS$id==pid,'cancer'];
+  this  <- fn_ProcessDicom(dcm);
+  df <- rbind(df, data.frame(
+    id      = as.character(pid),   
+    truth   = as.double(ifelse(is.null(nrow(truth)),NA,truth)),  
+    cancer  = 0.5,    
+    ncount  = 0,     
+    nwidth  = "",     
+    nlength = "",    
+    norm    = as.integer(sum(this$info$Lung.Normal)),     
+    benign  = as.integer(sum(this$info$Lung.Benign)),      
+    malign  = as.integer(sum(this$info$Lung.Malign)),      
+    mayo    = as.double(max(this$info$Diagnosis.Mayo)),   
+    elcap   = as.double(max(this$info$Diagnosis.ELCAP)),    
+    age     = as.double(unique(this$info$Patient.Age)),  
+    risk    = as.logical(unique(this$info$Patient.Risk))    
   ));
+  rm(dcm, this, truth);
+  gc();
 }
 timestamp();
 
-patientID <- list.files(path=INPUT_FOLDER);
-fname <- paste0(INPUT_FOLDER,"/00cba091fa4ad62cc3200a657aeb957e");
-dcm  <- readDICOM(fname, verbose=T, recursive=FALSE);
-this <- fn_ProcessDicom(dcm);
 
-j <- 1;
-par(mfrow=c(3, 1));
-hist(this$img_ct[[j]]);
-hist(this$img_hu[[j]]);
-hist(this$img_th[[j]]);
+
+
+
+# patientID <- list.files(path=INPUT_FOLDER);
+# fname <- paste0(INPUT_FOLDER,"/00cba091fa4ad62cc3200a657aeb957e");
+# dcm  <- readDICOM(fname, verbose=T, recursive=FALSE);
+# this <- fn_ProcessDicom(dcm);
+# 
+# j <- 1;
+# par(mfrow=c(3, 1));
+# hist(this$img_ct[[j]]);
+# hist(this$img_hu[[j]]);
+# hist(this$img_th[[j]]);
 
 par(mfrow=c(3, 1));
 image(this$img_ct[[j]], col=gray((0:256)/256)); 
