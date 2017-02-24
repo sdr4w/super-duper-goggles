@@ -1,3 +1,4 @@
+library(raster);
 library(data.table);
 library(spatstat);
 library(imager);
@@ -216,19 +217,8 @@ fn_ProcessDicom <- cmpfun(function(dcm){
     img_th[[i]] <- fn_DetectThreshold(img_hu[[i]]);              # Convert HU scan into B&W
     
     ## 
-    circles <- data.table(a=0,b=0,R=0);
-    lb  <- as.integer(dim(img_th[[i]])*0.3);
-    ub  <- as.integer(dim(img_th[[i]])*0.7);
-    rmx <- as.integer(45.0/min(spc1));
-    rmn <- as.integer(4.0/min(spc1));
-    for(j in lb[1]:ub[1]){
-      for(k in lb[2]:ub[2]){
-        tmp <- fn_IsCenterOfCircle(j, k, rmn, rmx, img_th[[i]]);
-        if(tmp[3] != 0){
-          circles <- rbind(circles, tmp);
-        }
-    }}
-    
+    circles <- fn_HoughCircle(img_th[[i]],spc1);
+
     ## HU Pixel Counting Features
     tmp <- img_hu[[i]];
     info$Lung.Normal[i] <- length(tmp[tmp < -300 & tmp > -700]);# Possible Normal Lung Tissue
@@ -260,26 +250,36 @@ fn_ProcessDicom <- cmpfun(function(dcm){
 #' 
 fn_IsCenterOfCircle <- cmpfun(function(a, b, rmin, rmax, im, cvalue=1) {
   
+  im <- as.matrix(im);
   out <- c(a,b,0);
   if(im[a,b] == cvalue){
-    nextR <- TRUE;
+    tht <- seq(from=0, to=2*pi, by=pi/16);
+    # nextR <- TRUE;
     for(R in rmin:rmax){
-      for(theta in seq(from=0, to=2*pi, by=pi/4)){
-        z <- c(as.integer(a+R*cos(theta)), as.integer(b+R*sin(theta)));
-        z[z<c(1,1)]  <- 1;
-        z[z>dim(im)] <- min(dim(im));
-        nextR <- nextR & ifelse(im[z[1],z[2]] == im[a,b], T, F);
-      }
-      if(!nextR){ break; }
+
+      x <- as.integer(a+R*cos(tht));
+      y <- as.integer(b+R*sin(tht));
+      v <- extract(im,cbind(x,y));
+      if( (length(v==cvalue)/length(v)) < 0.8){ break; }
       out[3] <- R; 
+      
+                  
+      # for(theta in seq(from=0, to=2*pi, by=pi/8)){
+      #   z <- c(as.integer(a+R*cos(theta)), as.integer(b+R*sin(theta)));
+      #   z[z<c(1,1)]  <- 1;
+      #   z[z>dim(im)] <- min(dim(im));
+      #   nextR <- nextR & ifelse(im[z[1],z[2]] == im[a,b], T, F);
+      # }
+      # if(!nextR){ break; }
+      # out[3] <- R; 
     }
   }
   return (out);
   
 });
 
-fn_HoughTransformCircles <- cmpfun(function(im, spc){
-  circles <- data.table(a=0,b=0,R=0);
+fn_HoughCircle <- cmpfun(function(im, spc){
+  circles <- data.table(a=NULL,b=NULL,R=NULL);
   lb  <- as.integer(dim(im)*0.3);
   ub  <- as.integer(dim(im)*0.7);
   rmx <- as.integer(45.0/min(spc));
@@ -293,6 +293,36 @@ fn_HoughTransformCircles <- cmpfun(function(im, spc){
   }}
   return (circles);
 });
+
+k <- 1;
+im <- load.image("./code/raw/test.jpg");
+im_gray   <- grayscale(im);
+im_blur   <- blur_anisotropic(im_gray, ampl=1e10);
+im_binary <- round(im_blur/(k*max(im_blur)), 0);
+par(mfrow=c(3, 1));
+# plot(im, main="Original");
+plot(im_gray, main="Greyscale");
+plot(im_blur, main="Blur");
+plot(im_binary, main="Binary");
+# blur_anisotropic(grayscale(im),ampl=1e9,sharp=1) %>% plot(main="Blurred (anisotropic)")
+# blur_anisotropic(round(grayscale(im)/max(grayscale(im)),0),ampl=1e9) %>% plot(main="Binary")
+
+par(mfrow=c(3, 1));
+round(im_blur/(0.2*max(im_blur)), 0) %>% plot(main="Binary .2");
+round(im_blur/(0.233*max(im_blur)), 0) %>% plot(main="Binary .233");
+round(im_blur/(0.267*max(im_blur)), 0) %>% plot(main="Binary .267");
+
+a<-300;
+b<-100;
+R<-75;
+
+theta <- seq(from=0, to=2*pi, by=pi/8);
+x  <- as.integer(a+R*cos(theta));
+y  <- as.integer(b+R*sin(theta));
+im <- as.matrix(im_binary);
+tmp  <- cbind(x,y,v=extract(im,cbind(x,y)));
+test <- count(tmp[,"v"] == im[a,b]);
+summary(test)
 
 ############################
 ##      Main Program      ##
